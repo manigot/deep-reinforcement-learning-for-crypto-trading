@@ -11,20 +11,20 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 import warnings
 
 class SantimentScraper:
-    INTERVALS = {'1h': 60, '24h': 1440}
-    COINS_DICT = {"BAT": "basic-attention-token", "FTM": "fantom", "ETH": "ethereum",  "BTC": "bitcoin", "USDT": "tether"}
+    INTERVALS = {'5m': 5, '1h': 60, '24h': 1440}
+    COINS_DICT = {"BAT": "basic-attention-token", "FTM": "fantom", "ETH": "ethereum", "BTC": "bitcoin", "USDT": "tether"}
     LOOKBACK = 168 # hours
     METRICS_24H_DELAY = 4 # hours
 
     def __init__(self, coins, resolutions, start_time, end_time, endpoint_file_paths, save_folder, mode):
         self.coins = coins
-        self.resolutions=resolutions
-        self.start_time=start_time
-        self.end_time=end_time
+        self.resolutions = resolutions
+        self.start_time = start_time
+        self.end_time = end_time
         self.save_folder = Path(save_folder)
         self.endpoint_file_paths = endpoint_file_paths
         self.endpoints_df = self.load_endpoints()
-        self.mode=mode
+        self.mode = mode
 
     def load_endpoints(self):
         endpoints = {}
@@ -42,11 +42,10 @@ class SantimentScraper:
         df.to_csv(folder_path / filename)
 
     def round_to_latest_four_am(self, dt):
-        # 1 day metrics from Santiment are scrapped at 4 am next day to reassure metric value is not changing
         return (dt - timedelta(hours=dt.hour - self.METRICS_24H_DELAY if dt.hour >= self.METRICS_24H_DELAY else dt.hour + (24 - self.METRICS_24H_DELAY))).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=1)
 
     def scrape(self):
-        if self.mode=="live":
+        if self.mode == "live":
             current_time = datetime.utcnow()
             file_time = current_time.replace(second=0, microsecond=0)
 
@@ -55,8 +54,8 @@ class SantimentScraper:
 
             self.start_time_human = self.start_time.strftime('%Y-%m-%d %H:%M:%S')
             self.end_time_human = self.end_time.strftime('%Y-%m-%d %H:%M:%S')
-            
-        if self.mode=="historical":
+
+        if self.mode == "historical":
             file_time = self.end_time 
             self.start_time_human = self.start_time.strftime('%Y-%m-%d %H:%M:%S')
             self.end_time_human = self.end_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -69,48 +68,59 @@ class SantimentScraper:
 
                 batch = AsyncBatch()
 
-                if resolution == "1h":
+                if resolution == "5m":
                     for metric in metrics:
                         batch.get(metric, slug=self.COINS_DICT[coin], from_date=self.start_time_human, to_date=self.end_time_human, interval=resolution)
 
-                # Santiment 1 day metrics should be collected at 4 am next day, to ensure all stored metrics are immutable
-                if resolution == "24h":    
+                elif resolution == "1h":
                     for metric in metrics:
-                        batch.get(metric, slug=self.COINS_DICT[coin], from_date=self.start_time_human, to_date=self.round_to_latest_four_am(self.end_time).strftime('%Y-%m-%d %H:%M:%S'), interval=resolution)   
+                        batch.get(metric, slug=self.COINS_DICT[coin], from_date=self.start_time_human, to_date=self.end_time_human, interval=resolution)
+
+                elif resolution == "24h":    
+                    for metric in metrics:
+                        batch.get(metric, slug=self.COINS_DICT[coin], from_date=self.start_time_human, to_date=self.round_to_latest_four_am(self.end_time).strftime('%Y-%m-%d %H:%M:%S'), interval=resolution)
 
                 batch_pd = batch.execute(max_workers=8)
 
-                placeholder = pd.DataFrame(index=pd.date_range(start=self.start_time_human, end=self.end_time_human, freq="1h", inclusive="left"))
+                placeholder_freq = "5T" if resolution == "5m" else "1H"
+                placeholder = pd.DataFrame(index=pd.date_range(start=self.start_time_human, end=self.end_time_human, freq=placeholder_freq, inclusive="left"))
                 placeholder.index = placeholder.index.tz_localize(None)
 
                 for i, item in enumerate(batch_pd):
                     item.index = item.index.tz_localize(None)
                     item.columns = [metrics[i]]
 
-                    if self.mode=="live":
+                    if self.mode == "live":
                         if resolution == "24h":
                             item.index += timedelta(hours=24 + self.METRICS_24H_DELAY)
 
-                        placeholder = placeholder.merge(item.asfreq('H', method='ffill'), how='left', left_index=True, right_index=True)
+                        placeholder = placeholder.merge(item.asfreq(placeholder_freq, method='ffill'), how='left', left_index=True, right_index=True)
                     
-                    if self.mode=="historical":
+                    if self.mode == "historical":
                         placeholder = placeholder.combine_first(item)
 
                     self.save_data_to_csv(item, coin, resolution, metrics[i])
 
-                placeholder = placeholder.fillna(method='ffill') #.fillna(0)
-                
-                if self.mode=="live":
-                    placeholder = placeholder.iloc[-self.LOOKBACK:] # 1 last week of data
+                placeholder = placeholder.fillna(method='ffill')
+
+                if self.mode == "live":
+                    placeholder = placeholder.iloc[-self.LOOKBACK:]
 
                 placeholder.index = placeholder.index.tz_localize(None)
-                placeholder.columns = [column+f'_{self.INTERVALS[resolution]:04d}_{coin}' for column in metrics]
+                placeholder.columns = [column + f'_{self.INTERVALS[resolution]:04d}_{coin}' for column in metrics]
 
                 placeholder.to_csv(os.path.join(self.save_folder, f"scraped_santiment_{coin}_{resolution}_{self.file_time.strftime('%Y-%m-%d_%H:%M:%S')}.csv"))
 
     def run_periodic_scrape(self):
         scheduler = BlockingScheduler()
-        scheduler.add_job(lambda: self.scrape(), 'cron', hour='*/1') # minute='*/1'
+        for resolution in self.resolutions:
+            if resolution == "5m":
+                scheduler.add_job(lambda: self.scrape(), 'interval', minutes=5)
+            elif resolution == "1h":
+                scheduler.add_job(lambda: self.scrape(), 'cron', hour='*')
+            elif resolution == "24h":
+                scheduler.add_job(lambda: self.scrape(), 'cron', hour=4)  # For daily scrapes at 4 AM
+
         scheduler.start()
 
 
